@@ -12,19 +12,26 @@ const DETECTIVE_TICKETS_TAXI: u8 = 10;
 const DETECTIVE_TICKETS_BUS: u8 = 8;
 const DETECTIVE_TICKETS_UNDERGROUND: u8 = 4;
 
+const MAX_MOVES: u8 = 24;
+
 const STARTING_POSITIONS: [u8; 18] = [13, 26, 29, 34, 50, 53, 91, 94, 103, 112, 117, 132, 138, 141, 155, 174, 197, 198];
 
 struct Player {
     addr: address,
 
-    position_trace: [u8; 24],
-    ticket_trace: [u8; 24],
+    // probably worth moving this to separate mappings
+    position_trace: [u8; MAX_MOVES + 1],
+    ticket_trace: [u8; MAX_MOVES],
 
     tickets_taxi: u8,
     tickets_bus: u8,
     tickets_underground: u8,
     tickets_concealed: u8,
     tickets_double_move: u8,
+
+    // for misterx if he is caught by detectives,
+    // for detectives if they are out of moves
+    lost: bool,
 }
 
 struct Game {
@@ -84,7 +91,8 @@ program scotlandyard.aleo {
     record MisterXTrace {
         owner: address,
         game_id: u64,
-        position_trace: [u8; 24],
+
+        position_trace: [u8; MAX_MOVES + 1],
     }
     
     @custom
@@ -110,13 +118,14 @@ program scotlandyard.aleo {
         let misterx: address = std::ctx::caller();
         assert_neq(misterx, detective);
 
-        let misterx_position_trace = [0u8; 24];
+        let misterx_position_trace = [0u8; MAX_MOVES + 1];
         misterx_position_trace[0u8] = misterx_start_position;
 
         let misterx_trace = MisterXTrace {
             owner: misterx,
             game_id: unverified_game_id,
-            position_trace: misterx_position_trace,
+
+            position_trace: [0u8; MAX_MOVES + 1],
         };
 
         return (
@@ -133,26 +142,30 @@ program scotlandyard.aleo {
                     misterx: Player {
                         addr: misterx,
 
-                        position_trace: [0u8; 24],
-                        ticket_trace: [0u8; 24],
+                        position_trace: [0u8; MAX_MOVES + 1],
+                        ticket_trace: [0u8; MAX_MOVES],
 
                         tickets_taxi: MISTERX_TICKETS_TAXI,
                         tickets_bus: MISTERX_TICKETS_BUS,
                         tickets_underground: MISTERX_TICKETS_UNDERGROUND,
                         tickets_concealed: MISTERX_TICKETS_CONCEALED,
                         tickets_double_move: MISTERX_TICKETS_DOUBLE_MOVE,
+
+                        lost: false,
                     },
                     detectives: [Player {
                         addr: detective,
 
-                        position_trace: [0u8; 24], // todo init proper detective start positions
-                        ticket_trace: [0u8; 24],
+                        position_trace: [0u8; MAX_MOVES + 1],
+                        ticket_trace: [0u8; MAX_MOVES],
 
                         tickets_taxi: DETECTIVE_TICKETS_TAXI,
                         tickets_bus: DETECTIVE_TICKETS_BUS,
                         tickets_underground: DETECTIVE_TICKETS_UNDERGROUND,
                         tickets_concealed: 0u8,
                         tickets_double_move: 0u8,
+
+                        lost: false,
                     }; 4],
                 });
 
@@ -175,33 +188,81 @@ program scotlandyard.aleo {
 
         assert_eq(game_id, misterx_trace.game_id);
 
+        let from_position = 0u8;
         let position_idx = 0u8;
 
-        for i in 0u8..24u8 {
+        for i in 0u8..MAX_MOVES {
             if misterx_trace.position_trace[i] > 0u8 {
+                from_position = misterx_trace.position_trace[i];
                 position_idx = i;
             }
         }
 
-        assert(position_idx < 24u8 - 1u8);
+        assert(position_idx < MAX_MOVES);
+
+        let misterx_lost = false;
+
+        for d in 0u8..GAME_DETECTIVES {
+            let detective_position = 0u8;
+
+            for i in 0u8..MAX_MOVES {
+                if i == position_idx {
+                    detective_position = unverified_game.detectives[d].position_trace[i];
+
+                    misterx_lost = misterx_lost || detective_position == from_position;
+                    misterx_lost = misterx_lost || detective_position == to_position;
+                }
+            }
+        }
+
+        assert(ticket == 1u8 || ticket == 2u8 || ticket == 4u8 || ticket == 8u8);
+        assert((transport_mask & ticket) != 0u8);
 
         let merkle_root = get_merkle_root(
             leaf_index,
             siblings,
-            misterx_trace.position_trace[position_idx],
+            from_position,
             to_position,
             transport_mask,
-        )
+        );
 
         let updated_position_trace = misterx_trace.position_trace;
-        updated_position_trace[position_idx + 1u8] = to_position;
+
+        for i in 0u8..MAX_MOVES + 1u8 {
+            if i == position_idx + 1u8 {
+                updated_position_trace[i] = to_position;
+            }
+        }
 
         let updated_misterx_trace = MisterXTrace {
             owner: misterx_trace.owner,
             game_id: misterx_trace.game_id,
-            position_trace: updated_position_trace,
-        }
 
-        // todo update onchain state of misterx ticket usage and possible reveals
+            position_trace: updated_position_trace,
+        };
+
+        let misterx_position_trace = misterx_lost ? updated_position_trace : unverified_game.misterx.position_trace;
+
+        return (
+            updated_misterx_trace,
+            final {
+                assert(games.contains(game_id));
+
+                let game = games.get(game_id);
+                assert_eq(game, unverified_game);
+
+                assert_eq(maps.get_or_use(game.map_id, 0field), merkle_root);
+
+                game.misterx.tickets_taxi = game.misterx.tickets_taxi - (ticket == 1u8 ? 1u8 : 0u8);
+                game.misterx.tickets_bus = game.misterx.tickets_bus - (ticket == 2u8 ? 1u8 : 0u8);
+                game.misterx.tickets_underground = game.misterx.tickets_underground - (ticket == 4u8 ? 1u8 : 0u8);
+                game.misterx.tickets_concealed = game.misterx.tickets_concealed - (ticket == 8u8 ? 1u8 : 0u8);
+                // how to handle double use tickets?
+
+                for i in 0u8..MAX_MOVES {
+                    game.misterx.ticket_trace[i] = i == position_idx ? ticket : game.misterx.ticket_trace[i];
+                }
+            }
+        );
     }
 }
